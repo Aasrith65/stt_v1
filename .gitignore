@@ -13,3 +13,8 @@ __pycache__/
 *.pyzwzwz
 *.pyzwzwzw
 *.pyzwzwzwz
+.ipynb_checkpoints/
+__pycache__/
+*.wav
+*.mp3
+*.log
