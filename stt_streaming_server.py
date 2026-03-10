@@ -12,6 +12,9 @@ Run: python run_streaming_server.py
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import json
 import os
 import tempfile
@@ -22,9 +25,24 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 import torch
+from pydantic import ValidationError
 
 from config import SessionConfig, ServerConfig, AudioEncoding
 from pipeline import StreamingPipeline, TranscriptEvent, _extract_text, SAMPLE_RATE
+from protocol import (
+    PROTOCOL_VERSION,
+    ClientConfigMessage,
+    ClientEndMessage,
+    ClientPingMessage,
+    ErrorCode,
+    ErrorEvent,
+    LegacyAudioChunkMessage,
+    PongEvent,
+    ProtocolCapabilities,
+    SessionCreatedEvent,
+    SessionEndedEvent,
+    protocol_spec,
+)
 
 try:
     # FastAPI resolves postponed annotations from module globals, not factory locals.
@@ -49,6 +67,96 @@ def _load_audio_file(file_path: str) -> np.ndarray:
     import librosa
     audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
     return audio.astype(np.float32)
+
+
+class ProtocolError(Exception):
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        close_code: Optional[int] = 1008,
+        retryable: bool = False,
+        details: Optional[dict] = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.close_code = close_code
+        self.retryable = retryable
+        self.details = details
+
+
+def _parse_json_message(text_data: str) -> dict:
+    try:
+        data = json.loads(text_data)
+    except json.JSONDecodeError as exc:
+        raise ProtocolError(
+            ErrorCode.INVALID_JSON,
+            "Text messages must be valid JSON.",
+            details={"error": str(exc)},
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ProtocolError(
+            ErrorCode.INVALID_MESSAGE,
+            "Text messages must decode to a JSON object.",
+        )
+    return data
+
+
+def _parse_initial_config(message: dict) -> SessionConfig:
+    if message.get("type") != "config":
+        raise ProtocolError(
+            ErrorCode.CONFIG_REQUIRED,
+            "The first websocket message must be a config object: {\"type\":\"config\",\"config\":{...}}.",
+        )
+
+    try:
+        if "config" in message:
+            config = ClientConfigMessage.model_validate(message).config
+        else:
+            config = SessionConfig.model_validate({
+                key: value for key, value in message.items() if key != "type"
+            })
+    except ValidationError as exc:
+        raise ProtocolError(
+            ErrorCode.CONFIG_INVALID,
+            "Invalid session config.",
+            details={"validation_errors": exc.errors()},
+        ) from exc
+
+    if config.sample_rate != SAMPLE_RATE:
+        raise ProtocolError(
+            ErrorCode.UNSUPPORTED_SAMPLE_RATE,
+            f"Only {SAMPLE_RATE} Hz audio is supported on /ws/stt.",
+            details={
+                "requested_sample_rate": config.sample_rate,
+                "supported_sample_rates_hz": [SAMPLE_RATE],
+            },
+        )
+
+    if config.language is not None:
+        raise ProtocolError(
+            ErrorCode.CONFIG_INVALID,
+            "language override is not supported by this websocket contract.",
+            details={"field": "language"},
+        )
+
+    if config.interim_results:
+        raise ProtocolError(
+            ErrorCode.CONFIG_INVALID,
+            "interim_results is not supported by this websocket contract.",
+            details={"field": "interim_results"},
+        )
+
+    return config
+
+
+def _frame_sample_count(data: bytes, encoding: AudioEncoding) -> int:
+    if encoding == AudioEncoding.PCM_F32LE:
+        return len(data) // 4
+    return len(data) // 2
 
 
 # ── App Factory ──────────────────────────────────────────────────────────────
@@ -84,6 +192,8 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
     asr_model = None
     device = server_config.resolve_device()
     active_sessions: dict = {}
+    capabilities = ProtocolCapabilities()
+    max_buffer_samples = server_config.max_buffer_seconds * SAMPLE_RATE
 
     @app.on_event("startup")
     async def startup():
@@ -120,21 +230,36 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
             "device": device,
             "active_sessions": len(active_sessions),
             "fp16": server_config.use_fp16,
+            "protocol_version": PROTOCOL_VERSION,
         }
 
     @app.get("/config/defaults")
     async def config_defaults():
         return SessionConfig().model_dump()
 
+    @app.get("/protocol")
+    async def protocol():
+        spec = protocol_spec()
+        spec["defaults"] = SessionConfig().model_dump()
+        spec["limits"] = {
+            "config_timeout_s": server_config.config_timeout_s,
+            "max_frame_bytes": server_config.max_frame_bytes,
+            "max_buffer_seconds": server_config.max_buffer_seconds,
+            "max_sessions": server_config.max_sessions,
+        }
+        return spec
+
     @app.get("/")
     async def root():
         return {
             "service": "Streaming STT API v2",
+            "protocol_version": PROTOCOL_VERSION,
             "endpoints": {
                 "websocket": "/ws/stt",
                 "file_upload": "POST /transcribe/file",
                 "health": "GET /health",
                 "config": "GET /config/defaults",
+                "protocol": "GET /protocol",
             },
             "protocol": "Connect to /ws/stt, send JSON config, then binary PCM frames.",
         }
@@ -145,107 +270,218 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
     async def ws_stt(websocket: WebSocket):
         await websocket.accept()
         session_id = uuid.uuid4().hex[:12]
+        sequence = 0
+
+        def next_sequence() -> int:
+            nonlocal sequence
+            sequence += 1
+            return sequence
+
+        async def send_event(payload: dict) -> None:
+            await websocket.send_json({
+                "protocol_version": PROTOCOL_VERSION,
+                "sequence": next_sequence(),
+                **payload,
+            })
+
+        async def send_error(
+            code: ErrorCode,
+            message: str,
+            *,
+            retryable: bool = False,
+            details: Optional[dict] = None,
+            close_code: Optional[int] = None,
+        ) -> None:
+            event = ErrorEvent(
+                code=code,
+                message=message,
+                retryable=retryable,
+                session_id=session_id,
+                details=details,
+                sequence=next_sequence(),
+            )
+            await websocket.send_json(event.model_dump())
+            if close_code is not None:
+                await websocket.close(code=close_code)
 
         # Check session limit
         if len(active_sessions) >= server_config.max_sessions:
-            await websocket.send_json({
-                "type": "error",
-                "message": f"Max sessions ({server_config.max_sessions}) reached. Try again later.",
-            })
-            await websocket.close()
+            await send_error(
+                ErrorCode.SESSION_LIMIT_REACHED,
+                f"Max sessions ({server_config.max_sessions}) reached. Try again later.",
+                retryable=True,
+                close_code=1013,
+            )
             return
 
         active_sessions[session_id] = time.time()
 
         try:
-            # Step 1: Wait for config message (with timeout)
-            config = SessionConfig()  # defaults
             try:
-                first_msg = await websocket.receive()
-                text_data = first_msg.get("text")
-                if text_data:
-                    msg = json.loads(text_data)
-                    if msg.get("type") == "config" and "config" in msg:
-                        config = SessionConfig(**msg["config"])
-                    elif msg.get("type") == "config":
-                        # Config at top level
-                        config = SessionConfig(**{
-                            k: v for k, v in msg.items() if k != "type"
-                        })
-                    else:
-                        # Not a config message — it might be audio or something else.
-                        # Use defaults and process this message below.
-                        pass
-            except Exception:
-                pass  # Use defaults
+                first_msg = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=server_config.config_timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                raise ProtocolError(
+                    ErrorCode.CONFIG_REQUIRED,
+                    f"Initial config message not received within {server_config.config_timeout_s:.1f}s.",
+                ) from exc
 
-            # Step 2: Create pipeline
+            if first_msg.get("bytes") is not None:
+                raise ProtocolError(
+                    ErrorCode.CONFIG_REQUIRED,
+                    "Binary audio cannot be sent before the initial config message.",
+                )
+
+            text_data = first_msg.get("text")
+            if not text_data:
+                raise ProtocolError(
+                    ErrorCode.CONFIG_REQUIRED,
+                    "The first websocket message must be a JSON config message.",
+                )
+
+            config = _parse_initial_config(_parse_json_message(text_data))
             pipeline = StreamingPipeline(asr_model, config, device)
 
-            # Step 3: Send session.created
-            await websocket.send_json({
-                "type": "session.created",
-                "session_id": session_id,
-                "config": config.model_dump(),
-            })
+            session_created = SessionCreatedEvent(
+                session_id=session_id,
+                config=config.model_dump(),
+                sequence=next_sequence(),
+                capabilities=capabilities,
+            )
+            await websocket.send_json(session_created.model_dump())
 
-            # Step 4: Stream audio
             segments_count = 0
             total_audio_samples = 0
             session_start = time.time()
 
             while True:
                 msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+
                 text_data = msg.get("text")
                 bytes_data = msg.get("bytes")
 
                 if bytes_data:
-                    # Binary PCM frame — main path
-                    total_audio_samples += len(bytes_data) // 2  # int16 = 2 bytes
+                    if len(bytes_data) > server_config.max_frame_bytes:
+                        raise ProtocolError(
+                            ErrorCode.FRAME_TOO_LARGE,
+                            f"Audio frame exceeds max_frame_bytes={server_config.max_frame_bytes}.",
+                            details={"frame_bytes": len(bytes_data)},
+                        )
+
+                    total_audio_samples += _frame_sample_count(bytes_data, config.encoding)
                     events = pipeline.feed_audio(bytes_data)
+                    if len(pipeline.audio_buffer) > max_buffer_samples:
+                        raise ProtocolError(
+                            ErrorCode.BUFFER_OVERFLOW,
+                            f"Buffered audio exceeded {server_config.max_buffer_seconds}s without a completed segment.",
+                            details={"max_buffer_seconds": server_config.max_buffer_seconds},
+                            close_code=1009,
+                        )
                     for event in events:
                         segments_count += 1
-                        await websocket.send_json(event.to_dict())
+                        await send_event(event.to_dict())
 
                 elif text_data:
-                    data = json.loads(text_data)
+                    data = _parse_json_message(text_data)
                     msg_type = data.get("type", "")
 
                     if msg_type == "end" or data.get("end"):
-                        # End of stream
+                        ClientEndMessage.model_validate({"type": "end"})
                         flush_events = pipeline.flush()
                         for event in flush_events:
                             segments_count += 1
-                            await websocket.send_json(event.to_dict())
+                            await send_event(event.to_dict())
 
-                        total_audio_s = total_audio_samples / SAMPLE_RATE
-                        await websocket.send_json({
-                            "type": "session.ended",
-                            "session_id": session_id,
-                            "segments_transcribed": segments_count,
-                            "total_audio_s": round(total_audio_s, 2),
-                            "session_duration_s": round(time.time() - session_start, 2),
-                        })
+                        total_audio_s = total_audio_samples / config.sample_rate
+                        ended = SessionEndedEvent(
+                            session_id=session_id,
+                            segments_transcribed=segments_count,
+                            total_audio_s=round(total_audio_s, 2),
+                            session_duration_s=round(time.time() - session_start, 2),
+                            reason="client_end",
+                            sequence=next_sequence(),
+                        )
+                        await websocket.send_json(ended.model_dump())
                         break
 
+                    elif msg_type == "ping":
+                        ping = ClientPingMessage.model_validate(data)
+                        pong = PongEvent(
+                            timestamp_ms=ping.timestamp_ms,
+                            sequence=next_sequence(),
+                        )
+                        await websocket.send_json(pong.model_dump())
+
+                    elif msg_type == "config":
+                        raise ProtocolError(
+                            ErrorCode.CONFIG_ALREADY_SET,
+                            "Config may only be sent once, before audio streaming begins.",
+                        )
+
                     elif "audio" in data:
-                        # Legacy: base64-encoded audio (backward compatibility)
-                        import base64
-                        pcm_bytes = base64.b64decode(data["audio"])
-                        total_audio_samples += len(pcm_bytes) // 2
+                        try:
+                            legacy_audio = LegacyAudioChunkMessage.model_validate(data)
+                            pcm_bytes = base64.b64decode(legacy_audio.audio, validate=True)
+                        except (ValidationError, binascii.Error) as exc:
+                            raise ProtocolError(
+                                ErrorCode.INVALID_MESSAGE,
+                                "Legacy base64 audio message is invalid.",
+                                details={"error": str(exc)},
+                            ) from exc
+
+                        if len(pcm_bytes) > server_config.max_frame_bytes:
+                            raise ProtocolError(
+                                ErrorCode.FRAME_TOO_LARGE,
+                                f"Audio frame exceeds max_frame_bytes={server_config.max_frame_bytes}.",
+                                details={"frame_bytes": len(pcm_bytes)},
+                            )
+
+                        total_audio_samples += _frame_sample_count(pcm_bytes, config.encoding)
                         events = pipeline.feed_audio(pcm_bytes)
+                        if len(pipeline.audio_buffer) > max_buffer_samples:
+                            raise ProtocolError(
+                                ErrorCode.BUFFER_OVERFLOW,
+                                f"Buffered audio exceeded {server_config.max_buffer_seconds}s without a completed segment.",
+                                details={"max_buffer_seconds": server_config.max_buffer_seconds},
+                                close_code=1009,
+                            )
                         for event in events:
                             segments_count += 1
-                            await websocket.send_json(event.to_dict())
+                            await send_event(event.to_dict())
+
+                    else:
+                        raise ProtocolError(
+                            ErrorCode.UNSUPPORTED_MESSAGE_TYPE,
+                            f"Unsupported message type: {msg_type or 'missing'}",
+                            details={"supported_types": ["config", "ping", "end"]},
+                        )
 
         except WebSocketDisconnect:
             pass
+        except ProtocolError as e:
+            try:
+                await send_error(
+                    e.code,
+                    e.message,
+                    retryable=e.retryable,
+                    details=e.details,
+                    close_code=e.close_code,
+                )
+            except Exception:
+                pass
         except Exception as e:
             try:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": str(e),
-                })
+                await send_error(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Unhandled server error.",
+                    retryable=False,
+                    details={"error": str(e)},
+                    close_code=1011,
+                )
             except Exception:
                 pass
         finally:
@@ -377,23 +613,24 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
         Route("/transcribe/file", _transcribe_file_handler, methods=["POST"])
     )
 
-    # Wrap the entire FastAPI app in a pure ASGI middleware that 
-    # executes BEFORE FastAPI or Uvicorn can touch the headers.
-    class AbsoluteNoOriginMiddleware:
-        def __init__(self, app):
-            self.app = app
-            
-        async def __call__(self, scope, receive, send):
-            if scope["type"] == "websocket":
-                # Delete 'origin' and 'host' so Starlette's WebSocket endpoint validation 
-                # (which expects them to match) simply skips the check.
-                scope["headers"] = [
-                    (k, v) for k, v in scope.get("headers", []) 
-                    if k.lower() not in (b"origin", b"host")
-                ]
-            await self.app(scope, receive, send)
+    if server_config.rewrite_websocket_headers:
+        # Compatibility shim for certain proxies that inject problematic Host/Origin
+        # values. Leave disabled in normal production deployments.
+        class AbsoluteNoOriginMiddleware:
+            def __init__(self, app):
+                self.app = app
 
-    return AbsoluteNoOriginMiddleware(app)
+            async def __call__(self, scope, receive, send):
+                if scope["type"] == "websocket":
+                    scope["headers"] = [
+                        (k, v) for k, v in scope.get("headers", [])
+                        if k.lower() not in (b"origin", b"host")
+                    ]
+                await self.app(scope, receive, send)
+
+        return AbsoluteNoOriginMiddleware(app)
+
+    return app
 
 # ── Default app instance (for uvicorn stt_streaming_server:app) ──────────
 

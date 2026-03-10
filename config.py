@@ -47,8 +47,8 @@ class SessionConfig(BaseModel):
     sample_rate: int = Field(16000, description="Audio sample rate in Hz")
     encoding: AudioEncoding = AudioEncoding.PCM_S16LE
     vad: VADConfig = Field(default_factory=VADConfig)
-    language: Optional[str] = Field(None, description="Language code (e.g. 'en'). None = auto-detect")
-    interim_results: bool = Field(True, description="Send partial transcripts during speech")
+    language: Optional[str] = Field(None, description="Reserved for future language override support. None = auto-detect")
+    interim_results: bool = Field(False, description="Reserved for future partial transcript support. Currently unsupported.")
     model_config = {"extra": "ignore"}
 
 
@@ -71,6 +71,27 @@ class ServerConfig(BaseModel):
     use_fp16: bool = Field(
         default=False,
         description="Use FP16 inference (faster on GPU, may reduce accuracy)"
+    )
+    config_timeout_s: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=60.0,
+        description="Seconds to wait for the initial websocket config message"
+    )
+    max_frame_bytes: int = Field(
+        default=256_000,
+        ge=512,
+        description="Max websocket audio frame size in bytes"
+    )
+    max_buffer_seconds: int = Field(
+        default=45,
+        ge=1,
+        le=600,
+        description="Max untranscribed audio buffered per websocket session"
+    )
+    rewrite_websocket_headers: bool = Field(
+        default_factory=lambda: os.environ.get("STT_REWRITE_WS_HEADERS", "").lower() in {"1", "true", "yes"},
+        description="Compatibility hack for unusual proxies; strips Host/Origin before app routing. Keep disabled in production unless required."
     )
 
     def resolve_device(self) -> str:

@@ -6,3 +6,8 @@ uvicorn[standard]>=0.22.0
 python-multipart>=0.0.6
 websockets>=11.0
 pydantic>=2.0
+numpy<2
+soundfile
+librosa
+torch>=2.0.0
+nemo_toolkit[asr]

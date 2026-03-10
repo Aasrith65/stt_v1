@@ -32,6 +32,14 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--fp16", action="store_true", help="Enable FP16 inference (GPU only)")
     parser.add_argument("--max-sessions", type=int, default=10, help="Max concurrent WS sessions")
+    parser.add_argument("--config-timeout", type=float, default=5.0, help="Seconds to wait for initial WS config")
+    parser.add_argument("--max-frame-bytes", type=int, default=256000, help="Max websocket audio frame size")
+    parser.add_argument("--max-buffer-seconds", type=int, default=45, help="Max untranscribed audio buffered per session")
+    parser.add_argument(
+        "--rewrite-ws-headers",
+        action="store_true",
+        help="Compatibility hack for unusual proxies; strips Host/Origin before routing",
+    )
     args = parser.parse_args()
 
     from config import ServerConfig
@@ -44,6 +52,10 @@ def main():
         port=args.port,
         use_fp16=args.fp16,
         max_sessions=args.max_sessions,
+        config_timeout_s=args.config_timeout,
+        max_frame_bytes=args.max_frame_bytes,
+        max_buffer_seconds=args.max_buffer_seconds,
+        rewrite_websocket_headers=args.rewrite_ws_headers,
     )
 
     app = create_streaming_app(server_config)
