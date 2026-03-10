@@ -16,6 +16,7 @@ import asyncio
 import json
 import sys
 import time
+from typing import Optional
 
 import numpy as np
 
@@ -33,7 +34,7 @@ async def run(
     chunk_ms: int = 100,
     vad_engine: str = "silero",
     silence_duration_ms: int = 800,
-    origin: str | None = None,
+    origin: Optional[str] = None,
     use_ngrok_header: bool = False,
 ):
     """Stream audio file to STT server and display results."""

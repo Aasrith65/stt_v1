@@ -15,6 +15,7 @@ import asyncio
 import json
 import sys
 import time
+from typing import Optional
 
 import numpy as np
 
@@ -86,7 +87,7 @@ class MockLLMProcessor:
 async def run(
     audio_path: str,
     ws_url: str = "ws://localhost:8000/ws/stt",
-    origin: str | None = None,
+    origin: Optional[str] = None,
     use_ngrok_header: bool = False,
 ):
     print("=" * 60)

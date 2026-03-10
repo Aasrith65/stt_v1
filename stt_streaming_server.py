@@ -26,6 +26,13 @@ import torch
 from config import SessionConfig, ServerConfig, AudioEncoding
 from pipeline import StreamingPipeline, TranscriptEvent, _extract_text, SAMPLE_RATE
 
+try:
+    # FastAPI resolves postponed annotations from module globals, not factory locals.
+    from fastapi import WebSocket, WebSocketDisconnect
+except ImportError:  # pragma: no cover - handled by create_streaming_app()
+    WebSocket = None  # type: ignore[assignment]
+    WebSocketDisconnect = None  # type: ignore[assignment]
+
 # Lazy NeMo import
 nemo_asr = None
 
@@ -48,7 +55,7 @@ def _load_audio_file(file_path: str) -> np.ndarray:
 
 def create_streaming_app(server_config: Optional[ServerConfig] = None):
     try:
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI
         from fastapi.responses import StreamingResponse, JSONResponse
     except ImportError:
         raise ImportError("pip install fastapi uvicorn websockets")
@@ -136,14 +143,7 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
 
     @app.websocket("/ws/stt")
     async def ws_stt(websocket: WebSocket):
-        print("\n--- [DEBUG] ENTERED ws_stt ENDPOINT ---")
-        try:
-            await websocket.accept()
-            print("--- [DEBUG] WEBSOCKET ACCEPTED SUCCESSFULLY ---")
-        except Exception as e:
-            print(f"--- [DEBUG] WEBSOCKET ACCEPT FAILED: {type(e)} {e} ---")
-            raise
-            
+        await websocket.accept()
         session_id = uuid.uuid4().hex[:12]
 
         # Check session limit
