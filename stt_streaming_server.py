@@ -363,7 +363,24 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
         Route("/transcribe/file", _transcribe_file_handler, methods=["POST"])
     )
 
-    return app
+    # Temporary ASGI middleware to debug ngrok WebSocket headers
+    class DebugASGIMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "websocket":
+                print("\n--- INCOMING WEBSOCKET SCOPE ---")
+                print(f"Path: {scope.get('path', 'None')}")
+                print(f"Client: {scope.get('client', 'None')}")
+                headers = dict(scope.get("headers", []))
+                for key, val in headers.items():
+                    print(f"  {key.decode('utf-8')}: {val.decode('utf-8')}")
+                print("--------------------------------\n")
+            await self.app(scope, receive, send)
+
+    app_with_debug = DebugASGIMiddleware(app)
+    return app_with_debug
 
 
 # ── Default app instance (for uvicorn stt_streaming_server:app) ──────────
