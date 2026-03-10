@@ -56,6 +56,8 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
     if server_config is None:
         server_config = ServerConfig()
 
+    app = FastAPI(title="Streaming STT API", version="2.0.0")
+
     # CORS for browser clients
     from fastapi.middleware.cors import CORSMiddleware
     app.add_middleware(
