@@ -249,7 +249,7 @@
         let latencies = [];
         let startTime = 0;
         const TARGET_SAMPLE_RATE = 16000;
-        const TARGET_CHUNK_MS = 100;
+        const TARGET_CHUNK_SAMPLES = 1536; // 96ms at 16kHz, aligned to 3 * 512 for Silero
 
         initializeDefaults();
 
@@ -410,23 +410,30 @@
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
+                        sampleRate: { ideal: TARGET_SAMPLE_RATE },
+                        sampleSize: 16,
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
                     }
                 });
 
-                audioContext = new AudioContext();
+                audioContext = new AudioContext({
+                    sampleRate: TARGET_SAMPLE_RATE,
+                    latencyHint: 'interactive',
+                });
                 await audioContext.resume();
 
                 // Register AudioWorklet for low-latency audio processing
                 await audioContext.audioWorklet.addModule(createWorkletURL());
 
                 const source = audioContext.createMediaStreamSource(mediaStream);
+                const audioTrack = mediaStream.getAudioTracks()[0];
+                const trackSettings = audioTrack && audioTrack.getSettings ? audioTrack.getSettings() : {};
                 workletNode = new AudioWorkletNode(audioContext, 'pcm-processor', {
                     processorOptions: {
                         targetSampleRate: TARGET_SAMPLE_RATE,
-                        targetChunkMs: TARGET_CHUNK_MS,
+                        targetChunkSize: TARGET_CHUNK_SAMPLES,
                     },
                 });
                 monitorNode = audioContext.createGain();
@@ -446,7 +453,7 @@
                 startTime = Date.now();
                 setStatus(`Recording... (${audioContext.sampleRate}Hz -> ${TARGET_SAMPLE_RATE}Hz)`, 'recording');
                 appendTranscript(
-                    `[microphone ready] browser=${audioContext.sampleRate}Hz server=${TARGET_SAMPLE_RATE}Hz`,
+                    `[microphone ready] track=${trackSettings.sampleRate || 'unknown'}Hz browser=${audioContext.sampleRate}Hz server=${TARGET_SAMPLE_RATE}Hz dsp=off`,
                     'seg-info'
                 );
 
@@ -494,23 +501,38 @@
                         super();
                         const processorOptions = options.processorOptions || {};
                         this.targetSampleRate = processorOptions.targetSampleRate || 16000;
-                        this.targetChunkMs = processorOptions.targetChunkMs || 100;
-                        this.targetChunkSize = Math.max(
-                            512,
-                            Math.round(this.targetSampleRate * this.targetChunkMs / 1000)
-                        );
+                        this.targetChunkSize = processorOptions.targetChunkSize || 1536;
+                        this.resampleRatio = sampleRate / this.targetSampleRate;
                         this.sourceChunkSize = Math.max(
                             128,
-                            Math.round(sampleRate * this.targetChunkMs / 1000)
+                            Math.round(this.targetChunkSize * this.resampleRatio)
                         );
                         this.buffer = [];
                     }
 
                     resampleChunk(input) {
-                        if (sampleRate === this.targetSampleRate) {
+                        if (sampleRate === this.targetSampleRate && input.length === this.targetChunkSize) {
                             return input;
                         }
                         const output = new Float32Array(this.targetChunkSize);
+
+                        const approxRatio = input.length / this.targetChunkSize;
+                        const roundedRatio = Math.round(approxRatio);
+                        const useAveraging = roundedRatio > 1 && Math.abs(approxRatio - roundedRatio) < 0.02;
+
+                        if (useAveraging) {
+                            for (let i = 0; i < this.targetChunkSize; i++) {
+                                const start = i * roundedRatio;
+                                const end = Math.min(input.length, start + roundedRatio);
+                                let sum = 0;
+                                for (let j = start; j < end; j++) {
+                                    sum += input[j];
+                                }
+                                output[i] = sum / Math.max(1, end - start);
+                            }
+                            return output;
+                        }
+
                         const ratio = (input.length - 1) / Math.max(1, this.targetChunkSize - 1);
                         for (let i = 0; i < this.targetChunkSize; i++) {
                             const pos = i * ratio;
