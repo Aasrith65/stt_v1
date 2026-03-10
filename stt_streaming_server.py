@@ -58,7 +58,7 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
 
     app = FastAPI(title="Streaming STT API", version="2.0.0")
 
-    # CORS for browser clients
+    # CORS for browser clients (HTTP only)
     from fastapi.middleware.cors import CORSMiddleware
     app.add_middleware(
         CORSMiddleware,
@@ -66,6 +66,22 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Uvicorn strictly rejects WebSocket connections if the Origin header
+    # doesn't match the Host (which often happens via ngrok or generic clients).
+    # We add a middleware to strip the Origin header from WebSockets to bypass this.
+    class AllowAllWebSocketsMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "websocket":
+                # Remove 'origin' header so Starlette/Uvicorn skips origin validation
+                headers = [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"origin"]
+                scope["headers"] = headers
+            await self.app(scope, receive, send)
+
+    app.add_middleware(AllowAllWebSocketsMiddleware)
 
     asr_model = None
     device = server_config.resolve_device()
