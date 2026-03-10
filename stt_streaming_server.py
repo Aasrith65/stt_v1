@@ -231,13 +231,29 @@ def create_streaming_app(
                         audio = _load_audio_file(tmp_path)
                         pipeline = StreamingSTTPipeline(asr_model, vad_model, vad_utils, device)
                         chunk_samples = int(1.0 * SAMPLE_RATE)
+
+                        # Buffer one transcript behind so we can mark the very
+                        # last one as is_final=True, even if it came from process()
+                        # rather than flush() (VAD often detects the last segment
+                        # end during the loop, leaving flush() with nothing to emit).
+                        pending = None
+
                         for i in range(0, len(audio), chunk_samples):
                             chunk = audio[i : i + chunk_samples]
                             pipeline.add_audio_float(chunk)
                             for t in pipeline.process():
-                                yield json.dumps({"text": t, "is_final": False}) + "\n"
+                                if pending is not None:
+                                    yield json.dumps({"text": pending, "is_final": False}) + "\n"
+                                pending = t
                         for t in pipeline.flush():
-                            yield json.dumps({"text": t, "is_final": True}) + "\n"
+                            if pending is not None:
+                                yield json.dumps({"text": pending, "is_final": False}) + "\n"
+                            pending = t
+
+                        # Emit the last (and truly final) transcript
+                        if pending is not None:
+                            yield json.dumps({"text": pending, "is_final": True}) + "\n"
+
                     finally:
                         try:
                             os.remove(tmp_path)
