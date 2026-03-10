@@ -56,26 +56,14 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
     if server_config is None:
         server_config = ServerConfig()
 
-    app = FastAPI(title="Streaming STT API", version="2.0.0")
-
-    # Custom CORS middleware that doesn't interfere with WebSocket connections.
-    # Starlette's CORSMiddleware can reject WebSocket upgrades with 403 in
-    # certain versions, so we handle CORS manually for HTTP only.
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import Response as StarletteResponse
-
-    @app.middleware("http")
-    async def cors_middleware(request: Request, call_next):
-        # Handle preflight
-        if request.method == "OPTIONS":
-            response = StarletteResponse(status_code=200)
-        else:
-            response = await call_next(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        return response
+    # CORS for browser clients
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     asr_model = None
     device = server_config.resolve_device()
