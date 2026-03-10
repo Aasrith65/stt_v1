@@ -163,7 +163,7 @@ def create_streaming_app(
     model_name: str = "nvidia/parakeet-tdt-1.1b",
 ):
     try:
-        from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
         from fastapi.responses import StreamingResponse
     except ImportError:
         raise ImportError("pip install fastapi uvicorn websockets")
@@ -197,17 +197,22 @@ def create_streaming_app(
         }
 
     @app.post("/transcribe/file")
-    async def transcribe_file(file: UploadFile = File(...)):
+    async def transcribe_file(request: Request):
         """
         Upload an audio file. Returns streaming transcript chunks (NDJSON).
         Each line: {"text": "...", "is_final": false/true}
+        Body: multipart/form-data with key "file"
         """
+        form = await request.form()
+        file = form.get("file")
+        if not file or not hasattr(file, "read"):
+            raise HTTPException(status_code=400, detail="No file provided. Use form-data key 'file'.")
         suffix = ".wav"
-        if file.filename and "." in file.filename:
+        if getattr(file, "filename", None) and "." in file.filename:
             suffix = "." + file.filename.rsplit(".", 1)[-1]
+        content = await file.read()
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             try:
-                content = await file.read()
                 tmp.write(content)
                 tmp.flush()
                 tmp_path = tmp.name
@@ -238,7 +243,7 @@ def create_streaming_app(
                 )
             except Exception as e:
                 try:
-                    os.remove(tmp_path)
+                    os.remove(tmp.name)
                 except OSError:
                     pass
                 raise HTTPException(status_code=400, detail=str(e))
