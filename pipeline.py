@@ -93,12 +93,13 @@ class StreamingPipeline:
 
         # Audio buffer: accumulates all audio for segment extraction
         self.audio_buffer = np.array([], dtype=np.float32)
+        self._buffer_start_sample = 0  # Absolute sample offset of audio_buffer[0]
         self._segment_id = 0
         self._session_start = time.time()
 
         # Track speech boundaries from VAD
         self._speech_start_sample: Optional[int] = None
-        self._pending_segments: List[tuple] = []  # [(start_sample, end_sample), ...]
+        self._pending_segments: List[tuple] = []  # Absolute [(start_sample, end_sample), ...]
 
     def feed_audio(self, data: bytes) -> List[TranscriptEvent]:
         """
@@ -153,7 +154,7 @@ class StreamingPipeline:
 
         # If VAD has an open speech segment, close it
         if self._speech_start_sample is not None:
-            end_sample = len(self.audio_buffer)
+            end_sample = self._buffer_start_sample + len(self.audio_buffer)
             self._pending_segments.append((self._speech_start_sample, end_sample))
             self._speech_start_sample = None
 
@@ -164,7 +165,9 @@ class StreamingPipeline:
         # transcribe the remaining buffer if it's long enough
         remaining = len(self.audio_buffer)
         if remaining >= int(0.3 * self.sample_rate) and not events:
+            t0 = time.perf_counter()
             text = self._transcribe_segment(self.audio_buffer)
+            latency_ms = (time.perf_counter() - t0) * 1000
             if text.strip():
                 self._segment_id += 1
                 events.append(TranscriptEvent(
@@ -172,8 +175,9 @@ class StreamingPipeline:
                     text=text,
                     segment_id=self._segment_id,
                     timestamp_ms=self._elapsed_ms(),
-                    audio_start_ms=0,
-                    audio_end_ms=remaining / self.sample_rate * 1000,
+                    audio_start_ms=self._buffer_start_sample / self.sample_rate * 1000,
+                    audio_end_ms=(self._buffer_start_sample + remaining) / self.sample_rate * 1000,
+                    latency_ms=latency_ms,
                 ))
 
         self._reset_buffer()
@@ -187,11 +191,16 @@ class StreamingPipeline:
         while self._pending_segments:
             start_sample, end_sample = self._pending_segments.pop(0)
 
-            # Clamp to buffer bounds
-            start_sample = max(0, min(start_sample, len(self.audio_buffer)))
-            end_sample = max(start_sample, min(end_sample, len(self.audio_buffer)))
+            # VAD timestamps are absolute session offsets, while audio_buffer is a sliding
+            # window that gets trimmed after each transcription.
+            buffer_end_sample = self._buffer_start_sample + len(self.audio_buffer)
+            start_sample = max(self._buffer_start_sample, min(start_sample, buffer_end_sample))
+            end_sample = max(start_sample, min(end_sample, buffer_end_sample))
 
-            segment_audio = self.audio_buffer[start_sample:end_sample]
+            rel_start = start_sample - self._buffer_start_sample
+            rel_end = end_sample - self._buffer_start_sample
+
+            segment_audio = self.audio_buffer[rel_start:rel_end]
 
             # Skip very short segments
             min_samples = int(self.config.vad.min_speech_duration_ms / 1000 * self.sample_rate)
@@ -215,12 +224,8 @@ class StreamingPipeline:
                 ))
 
             # Trim buffer up to end of this segment to free memory
-            self.audio_buffer = self.audio_buffer[end_sample:]
-            # Adjust remaining pending segment offsets
-            self._pending_segments = [
-                (s - end_sample, e - end_sample)
-                for s, e in self._pending_segments
-            ]
+            self.audio_buffer = self.audio_buffer[rel_end:]
+            self._buffer_start_sample = end_sample
 
         return events
 
@@ -254,5 +259,6 @@ class StreamingPipeline:
 
     def _reset_buffer(self) -> None:
         self.audio_buffer = np.array([], dtype=np.float32)
+        self._buffer_start_sample = 0
         self._speech_start_sample = None
         self._pending_segments = []

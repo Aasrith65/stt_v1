@@ -243,10 +243,15 @@
         let audioContext = null;
         let mediaStream = null;
         let workletNode = null;
+        let monitorNode = null;
         let isRecording = false;
         let segments = 0;
         let latencies = [];
         let startTime = 0;
+        const TARGET_SAMPLE_RATE = 16000;
+        const TARGET_CHUNK_MS = 100;
+
+        initializeDefaults();
 
         function setStatus(text, dotState) {
             document.getElementById('status-text').textContent = text;
@@ -273,27 +278,76 @@
             document.getElementById('stat-duration').textContent = elapsed.toFixed(1) + 's';
         }
 
+        function initializeDefaults() {
+            const wsUrlInput = document.getElementById('ws-url');
+            const suggested = defaultWebSocketUrl();
+            if (wsUrlInput && (!wsUrlInput.value || wsUrlInput.value === 'ws://localhost:8000/ws/stt')) {
+                wsUrlInput.value = suggested;
+            }
+        }
+
+        function defaultWebSocketUrl() {
+            const { protocol, hostname, port } = window.location;
+            if (!hostname) {
+                return 'ws://localhost:8000/ws/stt';
+            }
+
+            const isHttps = protocol === 'https:';
+            const wsProtocol = isHttps ? 'wss:' : 'ws:';
+            const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
+            const defaultPort = isLocalHost && !isHttps ? ':8000' : '';
+            const host = port && isLocalHost && !isHttps ? `${hostname}${defaultPort}` : hostname;
+            return `${wsProtocol}//${host}/ws/stt`;
+        }
+
+        function normalizeWebSocketUrl(rawUrl) {
+            const url = new URL(rawUrl, window.location.href);
+            const isNgrok = /(?:\.ngrok-free\.dev|\.ngrok\.io|\.ngrok\.app)$/i.test(url.hostname);
+            const isHttpsPage = window.location.protocol === 'https:';
+
+            if (isNgrok) {
+                url.protocol = 'wss:';
+                url.port = '';
+            } else if (isHttpsPage && url.protocol === 'ws:') {
+                url.protocol = 'wss:';
+            } else if (window.location.protocol === 'http:' && url.protocol === 'http:') {
+                url.protocol = 'ws:';
+            } else if (window.location.protocol === 'https:' && url.protocol === 'https:') {
+                url.protocol = 'wss:';
+            }
+
+            return url.toString();
+        }
+
         async function startRecording() {
-            const url = document.getElementById('ws-url').value;
+            const urlInput = document.getElementById('ws-url');
+            const url = normalizeWebSocketUrl(urlInput.value.trim() || defaultWebSocketUrl());
             const vadEngine = document.getElementById('vad-engine').value;
             const silenceMs = parseInt(document.getElementById('silence-ms').value);
             const vadThreshold = parseFloat(document.getElementById('vad-threshold').value);
+            urlInput.value = url;
 
             document.getElementById('transcript').innerHTML = '';
             segments = 0;
             latencies = [];
+            updateStats();
 
             try {
+                if (!window.isSecureContext) {
+                    throw new Error('Microphone access requires HTTPS or localhost');
+                }
+
                 // Connect WebSocket
                 setStatus('Connecting...', '');
                 ws = new WebSocket(url);
+                ws.binaryType = 'arraybuffer';
 
                 ws.onopen = async () => {
                     // Send config
                     ws.send(JSON.stringify({
                         type: 'config',
                         config: {
-                            sample_rate: 16000,
+                            sample_rate: TARGET_SAMPLE_RATE,
                             encoding: 'pcm_s16le',
                             vad: {
                                 enabled: vadEngine !== 'none',
@@ -310,7 +364,7 @@
 
                     if (data.type === 'session.created') {
                         setStatus('Session ' + data.session_id, 'connected');
-                        appendTranscript('[session created]', 'seg-info');
+                        appendTranscript(`[session created] url=${url}`, 'seg-info');
                         startMic();
                     } else if (data.type && data.type.startsWith('transcript.')) {
                         segments++;
@@ -330,11 +384,14 @@
 
                 ws.onerror = () => {
                     setStatus('Connection error', '');
-                    appendTranscript('[WebSocket error]', 'seg-info');
+                    appendTranscript(`[WebSocket error] ${url}`, 'seg-info');
                 };
 
-                ws.onclose = () => {
+                ws.onclose = (event) => {
                     setStatus('Disconnected', '');
+                    if (event.code !== 1000) {
+                        appendTranscript(`[socket closed] code=${event.code} reason=${event.reason || 'none'}`, 'seg-info');
+                    }
                     isRecording = false;
                     document.getElementById('btn-start').disabled = false;
                     document.getElementById('btn-stop').disabled = true;
@@ -353,39 +410,45 @@
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         channelCount: 1,
-                        sampleRate: 16000,
                         echoCancellation: true,
                         noiseSuppression: true,
+                        autoGainControl: true,
                     }
                 });
 
-                audioContext = new AudioContext({ sampleRate: 16000 });
+                audioContext = new AudioContext();
+                await audioContext.resume();
 
                 // Register AudioWorklet for low-latency audio processing
                 await audioContext.audioWorklet.addModule(createWorkletURL());
 
                 const source = audioContext.createMediaStreamSource(mediaStream);
-                workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+                workletNode = new AudioWorkletNode(audioContext, 'pcm-processor', {
+                    processorOptions: {
+                        targetSampleRate: TARGET_SAMPLE_RATE,
+                        targetChunkMs: TARGET_CHUNK_MS,
+                    },
+                });
+                monitorNode = audioContext.createGain();
+                monitorNode.gain.value = 0;
 
                 workletNode.port.onmessage = (event) => {
                     if (ws && ws.readyState === WebSocket.OPEN && isRecording) {
-                        // event.data is Float32Array → convert to Int16 → send binary
-                        const float32 = event.data;
-                        const int16 = new Int16Array(float32.length);
-                        for (let i = 0; i < float32.length; i++) {
-                            const s = Math.max(-1, Math.min(1, float32[i]));
-                            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                        }
-                        ws.send(int16.buffer);
+                        ws.send(event.data);
                     }
                 };
 
                 source.connect(workletNode);
-                workletNode.connect(audioContext.destination);
+                workletNode.connect(monitorNode);
+                monitorNode.connect(audioContext.destination);
 
                 isRecording = true;
                 startTime = Date.now();
-                setStatus('Recording...', 'recording');
+                setStatus(`Recording... (${audioContext.sampleRate}Hz -> ${TARGET_SAMPLE_RATE}Hz)`, 'recording');
+                appendTranscript(
+                    `[microphone ready] browser=${audioContext.sampleRate}Hz server=${TARGET_SAMPLE_RATE}Hz`,
+                    'seg-info'
+                );
 
                 // Update duration counter
                 const durationInterval = setInterval(() => {
@@ -410,6 +473,7 @@
             }
 
             if (workletNode) workletNode.disconnect();
+            if (monitorNode) monitorNode.disconnect();
             if (audioContext) audioContext.close();
             if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
 
@@ -426,19 +490,58 @@
         function createWorkletURL() {
             const code = `
                 class PCMProcessor extends AudioWorkletProcessor {
-                    constructor() {
+                    constructor(options) {
                         super();
+                        const processorOptions = options.processorOptions || {};
+                        this.targetSampleRate = processorOptions.targetSampleRate || 16000;
+                        this.targetChunkMs = processorOptions.targetChunkMs || 100;
+                        this.targetChunkSize = Math.max(
+                            512,
+                            Math.round(this.targetSampleRate * this.targetChunkMs / 1000)
+                        );
+                        this.sourceChunkSize = Math.max(
+                            128,
+                            Math.round(sampleRate * this.targetChunkMs / 1000)
+                        );
                         this.buffer = [];
-                        this.bufferSize = 2048; // ~128ms at 16kHz
                     }
+
+                    resampleChunk(input) {
+                        if (sampleRate === this.targetSampleRate) {
+                            return input;
+                        }
+                        const output = new Float32Array(this.targetChunkSize);
+                        const ratio = (input.length - 1) / Math.max(1, this.targetChunkSize - 1);
+                        for (let i = 0; i < this.targetChunkSize; i++) {
+                            const pos = i * ratio;
+                            const left = Math.floor(pos);
+                            const right = Math.min(left + 1, input.length - 1);
+                            const frac = pos - left;
+                            output[i] = input[left] + (input[right] - input[left]) * frac;
+                        }
+                        return output;
+                    }
+
+                    toInt16Buffer(float32) {
+                        const int16 = new Int16Array(float32.length);
+                        for (let i = 0; i < float32.length; i++) {
+                            const s = Math.max(-1, Math.min(1, float32[i]));
+                            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        return int16.buffer;
+                    }
+
                     process(inputs) {
                         const input = inputs[0];
                         if (input.length > 0) {
                             const channelData = input[0];
                             this.buffer.push(...channelData);
-                            if (this.buffer.length >= this.bufferSize) {
-                                const chunk = new Float32Array(this.buffer.splice(0, this.bufferSize));
-                                this.port.postMessage(chunk);
+
+                            while (this.buffer.length >= this.sourceChunkSize) {
+                                const sourceChunk = new Float32Array(this.buffer.splice(0, this.sourceChunkSize));
+                                const resampled = this.resampleChunk(sourceChunk);
+                                const pcmBuffer = this.toInt16Buffer(resampled);
+                                this.port.postMessage(pcmBuffer, [pcmBuffer]);
                             }
                         }
                         return true;

@@ -16,6 +16,7 @@ import json
 import sys
 import time
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -90,6 +91,7 @@ async def run(
     origin: Optional[str] = None,
     use_ngrok_header: bool = False,
 ):
+    ws_url = normalize_ws_url(ws_url)
     print("=" * 60)
     print("  MOCK LLM CONSUMER — STT Integration Demo")
     print("=" * 60)
@@ -177,6 +179,32 @@ async def run(
     print()
     print("In production, replace MockLLMProcessor._mock_llm_call()")
     print("with your actual LLM API call (OpenAI, Gemini, etc.)")
+
+
+def normalize_ws_url(ws_url: str) -> str:
+    parsed = urlsplit(ws_url)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname or ""
+
+    if not hostname:
+        return ws_url
+
+    is_ngrok = hostname.endswith((".ngrok-free.dev", ".ngrok.io", ".ngrok.app"))
+    if not is_ngrok:
+        return ws_url
+
+    normalized_scheme = {"http": "ws", "https": "wss", "ws": "wss"}.get(scheme, scheme)
+    normalized_port = parsed.port
+    if normalized_scheme == "wss":
+        normalized_port = None
+
+    if normalized_scheme == scheme and normalized_port == parsed.port:
+        return ws_url
+
+    netloc = hostname if normalized_port is None else f"{hostname}:{normalized_port}"
+    normalized = urlunsplit((normalized_scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    print(f"Normalized URL: {normalized}")
+    return normalized
 
 
 if __name__ == "__main__":

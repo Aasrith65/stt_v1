@@ -17,6 +17,7 @@ import json
 import sys
 import time
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -38,6 +39,7 @@ async def run(
     use_ngrok_header: bool = False,
 ):
     """Stream audio file to STT server and display results."""
+    ws_url = normalize_ws_url(ws_url)
     print(f"Loading: {audio_path}")
     audio, _ = librosa.load(audio_path, sr=16000, mono=True)
     pcm = (audio * 32767).astype(np.int16)
@@ -167,6 +169,39 @@ async def run(
     total_time = time.time() - stream_start
     print(f"  Total wall time: {total_time:.1f}s (for {duration:.1f}s audio)")
     print(f"  Real-time factor: {total_time / duration:.2f}x")
+
+
+def normalize_ws_url(ws_url: str) -> str:
+    """
+    Normalize user-provided URLs for public tunnel providers.
+
+    ngrok public endpoints terminate TLS on the public hostname, so the correct
+    client URL is typically `wss://<subdomain>.ngrok-free.dev/...` with no local
+    backend port like `:8000`.
+    """
+    parsed = urlsplit(ws_url)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname or ""
+
+    if not hostname:
+        return ws_url
+
+    is_ngrok = hostname.endswith((".ngrok-free.dev", ".ngrok.io", ".ngrok.app"))
+    if not is_ngrok:
+        return ws_url
+
+    normalized_scheme = {"http": "ws", "https": "wss", "ws": "wss"}.get(scheme, scheme)
+    normalized_port = parsed.port
+    if normalized_scheme == "wss":
+        normalized_port = None
+
+    if normalized_scheme == scheme and normalized_port == parsed.port:
+        return ws_url
+
+    netloc = hostname if normalized_port is None else f"{hostname}:{normalized_port}"
+    normalized = urlunsplit((normalized_scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    print(f"Normalized URL: {normalized}")
+    return normalized
 
 
 if __name__ == "__main__":
