@@ -58,8 +58,16 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
 
     app = FastAPI(title="Streaming STT API", version="2.0.0")
 
-    # CORS for browser clients (HTTP only)
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+    # 1. Allow any Host header (prevents 400/403 Invalid Host errors behind proxies)
+    app.add_middleware(
+        TrustedHostMiddleware, 
+        allowed_hosts=["*"]
+    )
+
+    # 2. CORS for browser clients (HTTP only)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -67,7 +75,7 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
         allow_headers=["*"],
     )
 
-    # Uvicorn strictly rejects WebSocket connections if the Origin header
+    # 3. Uvicorn strictly rejects WebSocket connections if the Origin header
     # doesn't match the Host (which often happens via ngrok or generic clients).
     # We add a middleware to strip the Origin header from WebSockets to bypass this.
     class AllowAllWebSocketsMiddleware:

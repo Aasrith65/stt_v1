@@ -52,7 +52,8 @@ def main():
         host=args.host, 
         port=args.port, 
         proxy_headers=True, 
-        forwarded_allow_ips="*"
+        forwarded_allow_ips="*",
+        ws="wsproto"
     )
 
 
