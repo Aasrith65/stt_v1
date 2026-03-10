@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STT Streaming — Browser Test Client</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --border: #2a2d3a;
+            --text: #e4e6eb;
+            --text-dim: #8b8fa3;
+            --accent: #6c63ff;
+            --accent-glow: rgba(108, 99, 255, 0.25);
+            --green: #2dd4a0;
+            --green-dim: rgba(45, 212, 160, 0.15);
+            --red: #ef4444;
+            --red-dim: rgba(239, 68, 68, 0.15);
+            --radius: 12px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem 1rem;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--accent), var(--green));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 1.5rem; }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 1.25rem;
+            width: 100%;
+            max-width: 640px;
+            margin-bottom: 1rem;
+        }
+
+        .card h2 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-dim);
+            margin-bottom: 0.75rem;
+        }
+
+        .config-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.75rem;
+        }
+
+        label {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            display: block;
+            margin-bottom: 0.25rem;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 0.85rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input:focus, select:focus { border-color: var(--accent); }
+
+        .btn-row { display: flex; gap: 0.75rem; margin-top: 1rem; }
+
+        button {
+            flex: 1;
+            padding: 0.65rem 1rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-start {
+            background: var(--green);
+            color: var(--bg);
+        }
+        .btn-start:hover { box-shadow: 0 0 20px var(--green-dim); }
+        .btn-start:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .btn-stop {
+            background: var(--red);
+            color: white;
+        }
+        .btn-stop:hover { box-shadow: 0 0 20px var(--red-dim); }
+        .btn-stop:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0;
+            font-size: 0.8rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-dim);
+            transition: background 0.3s;
+        }
+
+        .status-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+        .status-dot.recording { background: var(--red); box-shadow: 0 0 8px var(--red); animation: pulse 1.5s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        #transcript {
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.82rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            color: var(--text);
+        }
+
+        #transcript:empty::before {
+            content: 'Transcription will appear here...';
+            color: var(--text-dim);
+            font-style: italic;
+        }
+
+        .seg-final { color: var(--green); }
+        .seg-info { color: var(--text-dim); font-size: 0.75rem; }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.5rem;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .stat-label {
+            font-size: 0.7rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <h1>🎙 Streaming STT</h1>
+    <p class="subtitle">Browser → WebSocket → Parakeet ASR → Live Transcript</p>
+
+    <!-- Config -->
+    <div class="card">
+        <h2>Configuration</h2>
+        <div class="config-grid">
+            <div>
+                <label for="ws-url">WebSocket URL</label>
+                <input type="text" id="ws-url" value="ws://localhost:8000/ws/stt" placeholder="ws://...">
+            </div>
+            <div>
+                <label for="vad-engine">VAD Engine</label>
+                <select id="vad-engine">
+                    <option value="silero" selected>Silero (neural)</option>
+                    <option value="energy">Energy (RMS)</option>
+                    <option value="none">None (fixed interval)</option>
+                </select>
+            </div>
+            <div>
+                <label for="silence-ms">Silence Duration (ms)</label>
+                <input type="number" id="silence-ms" value="800" min="100" max="5000">
+            </div>
+            <div>
+                <label for="vad-threshold">VAD Threshold</label>
+                <input type="number" id="vad-threshold" value="0.5" min="0" max="1" step="0.05">
+            </div>
+        </div>
+        <div class="btn-row">
+            <button class="btn-start" id="btn-start" onclick="startRecording()">▶ Start Recording</button>
+            <button class="btn-stop" id="btn-stop" onclick="stopRecording()" disabled>■ Stop</button>
+        </div>
+        <div class="status-bar">
+            <div class="status-dot" id="status-dot"></div>
+            <span id="status-text">Idle</span>
+        </div>
+    </div>
+
+    <!-- Transcript -->
+    <div class="card">
+        <h2>Transcript</h2>
+        <div id="transcript"></div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card">
+        <h2>Stats</h2>
+        <div class="stats">
+            <div><div class="stat-value" id="stat-segments">0</div><div class="stat-label">Segments</div></div>
+            <div><div class="stat-value" id="stat-latency">—</div><div class="stat-label">Avg Latency</div></div>
+            <div><div class="stat-value" id="stat-duration">0.0s</div><div class="stat-label">Audio</div></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let workletNode = null;
+        let isRecording = false;
+        let segments = 0;
+        let latencies = [];
+        let startTime = 0;
+
+        function setStatus(text, dotState) {
+            document.getElementById('status-text').textContent = text;
+            const dot = document.getElementById('status-dot');
+            dot.className = 'status-dot ' + (dotState || '');
+        }
+
+        function appendTranscript(text, className) {
+            const div = document.getElementById('transcript');
+            const span = document.createElement('span');
+            span.className = className || '';
+            span.textContent = text + '\n';
+            div.appendChild(span);
+            div.scrollTop = div.scrollHeight;
+        }
+
+        function updateStats() {
+            document.getElementById('stat-segments').textContent = segments;
+            if (latencies.length > 0) {
+                const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+                document.getElementById('stat-latency').textContent = Math.round(avg) + 'ms';
+            }
+            const elapsed = (Date.now() - startTime) / 1000;
+            document.getElementById('stat-duration').textContent = elapsed.toFixed(1) + 's';
+        }
+
+        async function startRecording() {
+            const url = document.getElementById('ws-url').value;
+            const vadEngine = document.getElementById('vad-engine').value;
+            const silenceMs = parseInt(document.getElementById('silence-ms').value);
+            const vadThreshold = parseFloat(document.getElementById('vad-threshold').value);
+
+            document.getElementById('transcript').innerHTML = '';
+            segments = 0;
+            latencies = [];
+
+            try {
+                // Connect WebSocket
+                setStatus('Connecting...', '');
+                ws = new WebSocket(url);
+
+                ws.onopen = async () => {
+                    // Send config
+                    ws.send(JSON.stringify({
+                        type: 'config',
+                        config: {
+                            sample_rate: 16000,
+                            encoding: 'pcm_s16le',
+                            vad: {
+                                enabled: vadEngine !== 'none',
+                                engine: vadEngine,
+                                silence_duration_ms: silenceMs,
+                                threshold: vadThreshold,
+                            },
+                        },
+                    }));
+                };
+
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === 'session.created') {
+                        setStatus('Session ' + data.session_id, 'connected');
+                        appendTranscript('[session created]', 'seg-info');
+                        startMic();
+                    } else if (data.type && data.type.startsWith('transcript.')) {
+                        segments++;
+                        latencies.push(data.latency_ms || 0);
+                        const marker = data.type === 'transcript.final' ? '✓' : '…';
+                        appendTranscript(
+                            `[${marker} seg=${data.segment_id}  ${Math.round(data.latency_ms)}ms]  ${data.text}`,
+                            data.type === 'transcript.final' ? 'seg-final' : ''
+                        );
+                        updateStats();
+                    } else if (data.type === 'session.ended') {
+                        appendTranscript(`[session ended — ${data.segments_transcribed} segments, ${data.total_audio_s}s audio]`, 'seg-info');
+                    } else if (data.type === 'error') {
+                        appendTranscript('[ERROR] ' + data.message, 'seg-info');
+                    }
+                };
+
+                ws.onerror = () => {
+                    setStatus('Connection error', '');
+                    appendTranscript('[WebSocket error]', 'seg-info');
+                };
+
+                ws.onclose = () => {
+                    setStatus('Disconnected', '');
+                    isRecording = false;
+                    document.getElementById('btn-start').disabled = false;
+                    document.getElementById('btn-stop').disabled = true;
+                };
+
+                document.getElementById('btn-start').disabled = true;
+                document.getElementById('btn-stop').disabled = false;
+
+            } catch (err) {
+                setStatus('Error: ' + err.message, '');
+            }
+        }
+
+        async function startMic() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                    }
+                });
+
+                audioContext = new AudioContext({ sampleRate: 16000 });
+
+                // Register AudioWorklet for low-latency audio processing
+                await audioContext.audioWorklet.addModule(createWorkletURL());
+
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+
+                workletNode.port.onmessage = (event) => {
+                    if (ws && ws.readyState === WebSocket.OPEN && isRecording) {
+                        // event.data is Float32Array → convert to Int16 → send binary
+                        const float32 = event.data;
+                        const int16 = new Int16Array(float32.length);
+                        for (let i = 0; i < float32.length; i++) {
+                            const s = Math.max(-1, Math.min(1, float32[i]));
+                            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        ws.send(int16.buffer);
+                    }
+                };
+
+                source.connect(workletNode);
+                workletNode.connect(audioContext.destination);
+
+                isRecording = true;
+                startTime = Date.now();
+                setStatus('Recording...', 'recording');
+
+                // Update duration counter
+                const durationInterval = setInterval(() => {
+                    if (!isRecording) {
+                        clearInterval(durationInterval);
+                        return;
+                    }
+                    updateStats();
+                }, 500);
+
+            } catch (err) {
+                setStatus('Mic error: ' + err.message, '');
+                appendTranscript('[Mic access denied or unavailable]', 'seg-info');
+            }
+        }
+
+        function stopRecording() {
+            isRecording = false;
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'end' }));
+            }
+
+            if (workletNode) workletNode.disconnect();
+            if (audioContext) audioContext.close();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+
+            setStatus('Stopped', '');
+            document.getElementById('btn-start').disabled = false;
+            document.getElementById('btn-stop').disabled = true;
+
+            // Close WS after a short delay to receive final events
+            setTimeout(() => {
+                if (ws) ws.close();
+            }, 2000);
+        }
+
+        function createWorkletURL() {
+            const code = `
+                class PCMProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.buffer = [];
+                        this.bufferSize = 2048; // ~128ms at 16kHz
+                    }
+                    process(inputs) {
+                        const input = inputs[0];
+                        if (input.length > 0) {
+                            const channelData = input[0];
+                            this.buffer.push(...channelData);
+                            if (this.buffer.length >= this.bufferSize) {
+                                const chunk = new Float32Array(this.buffer.splice(0, this.bufferSize));
+                                this.port.postMessage(chunk);
+                            }
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('pcm-processor', PCMProcessor);
+            `;
+            const blob = new Blob([code], { type: 'application/javascript' });
+            return URL.createObjectURL(blob);
+        }
+    </script>
+</body>
+</html>

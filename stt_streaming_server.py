@@ -1,18 +1,21 @@
 """
-Streaming STT Server
+Streaming STT Server — Production Real-Time Service
 
-- WebSocket: streaming audio via ws://.../ws/transcribe (base64 JSON)
-- HTTP: POST /transcribe/file - upload audio file, receive streaming transcript chunks
+Endpoints:
+    WebSocket  /ws/stt           — Real-time streaming (binary PCM + JSON events)
+    POST       /transcribe/file  — Upload audio file, receive streaming NDJSON
+    GET        /health            — Health check
+    GET        /config/defaults   — Default session configuration
 
 Run: python run_streaming_server.py
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import tempfile
+import time
 import uuid
 from typing import Optional
 
@@ -20,7 +23,10 @@ import numpy as np
 import soundfile as sf
 import torch
 
-# Lazy imports
+from config import SessionConfig, ServerConfig, AudioEncoding
+from pipeline import StreamingPipeline, TranscriptEvent, _extract_text, SAMPLE_RATE
+
+# Lazy NeMo import
 nemo_asr = None
 
 
@@ -31,229 +37,310 @@ def _get_nemo():
     return nemo_asr
 
 
-def _extract_text(output) -> str:
-    if isinstance(output, tuple) and len(output) > 0:
-        output = output[0]
-    if not isinstance(output, (list, tuple)) or len(output) == 0:
-        return str(output)
-    first = output[0]
-    if isinstance(first, list) and first:
-        first = first[0]
-    return first.text if hasattr(first, "text") else str(first)
-
-
-# ── Silero VAD (streaming) ───────────────────────────────────────────────────
-
-VAD_WINDOW = 512  # 32ms at 16kHz
-SAMPLE_RATE = 16000
-
-
-def load_silero_vad():
-    model, utils = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        force_reload=False,
-        trust_repo=True,
-    )
-    return model, utils
-
-
-def create_vad_iterator(model, utils, sample_rate: int = 16000):
-    """Create streaming VAD iterator. Needs 512 samples per call at 16kHz."""
-    VADIterator = utils[3]
-    return VADIterator(model, sampling_rate=sample_rate)
-
-
-# ── Streaming pipeline ────────────────────────────────────────────────────────
-
-class StreamingSTTPipeline:
-    """
-    Per-connection pipeline: buffer → VAD → transcribe → send.
-    """
-
-    def __init__(self, asr_model, vad_model, vad_utils, device: str):
-        self.asr_model = asr_model
-        self.vad_model = vad_model
-        self.device = device
-        self.vad_iterator = create_vad_iterator(vad_model, vad_utils, SAMPLE_RATE)
-        self.buffer = np.array([], dtype=np.float32)
-        self._fed_samples = 0
-        self._segment_start = None  # tracks start of current speech segment
-
-    def add_audio(self, pcm_int16: np.ndarray) -> None:
-        """Append PCM int16 to buffer. Converts to float32 [-1, 1]."""
-        float32 = pcm_int16.astype(np.float32) / 32768.0
-        self.buffer = np.concatenate([self.buffer, float32])
-
-    def add_audio_float(self, audio_float: np.ndarray) -> None:
-        """Append float32 [-1,1] audio to buffer."""
-        self.buffer = np.concatenate([self.buffer, audio_float.astype(np.float32)])
-
-    def process(self) -> list[str]:
-        """
-        Feed buffer to VAD. Return list of transcripts for completed segments.
-        Trims buffer after each segment.
-        """
-        transcripts = []
-        while len(self.buffer) - self._fed_samples >= VAD_WINDOW:
-            chunk = self.buffer[self._fed_samples : self._fed_samples + VAD_WINDOW]
-            self._fed_samples += VAD_WINDOW
-
-            chunk_tensor = torch.from_numpy(chunk).float()
-            speech_dict = self.vad_iterator(chunk_tensor, return_seconds=True)
-
-            if speech_dict:
-                # Silero VAD fires TWO separate events:
-                #   {"start": X}  — speech begins
-                #   {"end": X}    — speech ends
-                # We cache the start and only transcribe on the end event.
-                if "start" in speech_dict:
-                    self._segment_start = speech_dict["start"]
-
-                if "end" in speech_dict and self._segment_start is not None:
-                    start_s = self._segment_start
-                    end_s = speech_dict["end"]
-                    start_idx = int(start_s * SAMPLE_RATE)
-                    end_idx = int(end_s * SAMPLE_RATE)
-                    end_idx = min(end_idx, len(self.buffer), self._fed_samples)
-                    start_idx = max(0, min(start_idx, end_idx - 1))
-
-                    if end_idx > start_idx:
-                        segment = self.buffer[start_idx:end_idx]
-                        text = self._transcribe_segment(segment)
-                        if text.strip():
-                            transcripts.append(text)
-
-                    self._segment_start = None
-                    self.vad_iterator.reset_states()
-                    self._trim_buffer(end_idx)
-                    self._fed_samples = 0
-
-        return transcripts
-
-    def flush(self) -> list[str]:
-        """Flush remaining buffer. Treat rest as final segment if long enough."""
-        transcripts = []
-        self.process()
-        if len(self.buffer) >= int(0.3 * SAMPLE_RATE):
-            text = self._transcribe_segment(self.buffer)
-            if text.strip():
-                transcripts.append(text)
-        self.buffer = np.array([], dtype=np.float32)
-        self._fed_samples = 0
-        self._segment_start = None
-        self.vad_iterator.reset_states()
-        return transcripts
-
-    def _transcribe_segment(self, segment: np.ndarray) -> str:
-        tmp = f"/tmp/_stt_seg_{uuid.uuid4().hex}.wav"
-        try:
-            sf.write(tmp, segment.astype(np.float32), SAMPLE_RATE)
-            out = self.asr_model.transcribe([tmp], batch_size=1, verbose=False)
-            return _extract_text(out).strip()
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-
-    def _trim_buffer(self, keep_from: int) -> None:
-        self.buffer = self.buffer[keep_from:].copy()
-
-
-# ── FastAPI + WebSocket ─────────────────────────────────────────────────────
-
 def _load_audio_file(file_path: str) -> np.ndarray:
-    """Load audio file as 16kHz mono float32. Uses librosa for format support."""
+    """Load audio file as 16kHz mono float32."""
     import librosa
     audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
     return audio.astype(np.float32)
 
 
-def create_streaming_app(
-    model_name: str = "nvidia/parakeet-tdt-1.1b",
-):
+# ── App Factory ──────────────────────────────────────────────────────────────
+
+def create_streaming_app(server_config: Optional[ServerConfig] = None):
     try:
-        from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-        from fastapi.responses import StreamingResponse
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi.responses import StreamingResponse, JSONResponse
+        from fastapi.middleware.cors import CORSMiddleware
     except ImportError:
         raise ImportError("pip install fastapi uvicorn websockets")
 
-    app = FastAPI(title="Streaming STT API")
+    if server_config is None:
+        server_config = ServerConfig()
+
+    app = FastAPI(title="Streaming STT API", version="2.0.0")
+
+    # CORS for browser clients
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     asr_model = None
-    vad_model = None
-    vad_utils = None
+    device = server_config.resolve_device()
+    active_sessions: dict = {}
 
     @app.on_event("startup")
     async def startup():
-        nonlocal asr_model, vad_model, vad_utils
+        nonlocal asr_model
         nemo = _get_nemo()
-        print("Loading Parakeet...")
-        asr_model = nemo.models.EncDecRNNTBPEModel.from_pretrained(model_name=model_name)
-        asr_model = asr_model.to("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading {server_config.model_name} on {device}...")
+        asr_model = nemo.models.EncDecRNNTBPEModel.from_pretrained(
+            model_name=server_config.model_name
+        )
+        asr_model = asr_model.to(device)
         asr_model.eval()
         asr_model.freeze()
-        print("Loading Silero VAD...")
-        vad_model, vad_utils = load_silero_vad()
-        print("Ready.")
+
+        if server_config.use_fp16 and device == "cuda":
+            asr_model = asr_model.half()
+            print("FP16 inference enabled.")
+
+        print("Loading Silero VAD (warmup)...")
+        # Warmup VAD so first connection is fast
+        from vad import SileroVAD
+        from config import VADConfig
+        _warmup_vad = SileroVAD(VADConfig(), SAMPLE_RATE)
+        del _warmup_vad
+
+        print("Server ready.")
+
+    # ── Health & Info ────────────────────────────────────────────────────
+
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "model": server_config.model_name,
+            "device": device,
+            "active_sessions": len(active_sessions),
+            "fp16": server_config.use_fp16,
+        }
+
+    @app.get("/config/defaults")
+    async def config_defaults():
+        return SessionConfig().model_dump()
 
     @app.get("/")
     async def root():
         return {
-            "status": "ok",
-            "ws_url": "/ws/transcribe",
-            "file_url": "POST /transcribe/file",
-            "protocol": "Send JSON: {\"audio\": \"base64...\"} or {\"end\": true}",
+            "service": "Streaming STT API v2",
+            "endpoints": {
+                "websocket": "/ws/stt",
+                "file_upload": "POST /transcribe/file",
+                "health": "GET /health",
+                "config": "GET /config/defaults",
+            },
+            "protocol": "Connect to /ws/stt, send JSON config, then binary PCM frames.",
         }
 
+    # ── WebSocket: Real-time streaming STT ───────────────────────────────
+
+    @app.websocket("/ws/stt")
+    async def ws_stt(websocket: WebSocket):
+        await websocket.accept()
+        session_id = uuid.uuid4().hex[:12]
+
+        # Check session limit
+        if len(active_sessions) >= server_config.max_sessions:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Max sessions ({server_config.max_sessions}) reached. Try again later.",
+            })
+            await websocket.close()
+            return
+
+        active_sessions[session_id] = time.time()
+
+        try:
+            # Step 1: Wait for config message (with timeout)
+            config = SessionConfig()  # defaults
+            try:
+                first_msg = await websocket.receive()
+                text_data = first_msg.get("text")
+                if text_data:
+                    msg = json.loads(text_data)
+                    if msg.get("type") == "config" and "config" in msg:
+                        config = SessionConfig(**msg["config"])
+                    elif msg.get("type") == "config":
+                        # Config at top level
+                        config = SessionConfig(**{
+                            k: v for k, v in msg.items() if k != "type"
+                        })
+                    else:
+                        # Not a config message — it might be audio or something else.
+                        # Use defaults and process this message below.
+                        pass
+            except Exception:
+                pass  # Use defaults
+
+            # Step 2: Create pipeline
+            pipeline = StreamingPipeline(asr_model, config, device)
+
+            # Step 3: Send session.created
+            await websocket.send_json({
+                "type": "session.created",
+                "session_id": session_id,
+                "config": config.model_dump(),
+            })
+
+            # Step 4: Stream audio
+            segments_count = 0
+            total_audio_samples = 0
+            session_start = time.time()
+
+            while True:
+                msg = await websocket.receive()
+                text_data = msg.get("text")
+                bytes_data = msg.get("bytes")
+
+                if bytes_data:
+                    # Binary PCM frame — main path
+                    total_audio_samples += len(bytes_data) // 2  # int16 = 2 bytes
+                    events = pipeline.feed_audio(bytes_data)
+                    for event in events:
+                        segments_count += 1
+                        await websocket.send_json(event.to_dict())
+
+                elif text_data:
+                    data = json.loads(text_data)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "end" or data.get("end"):
+                        # End of stream
+                        flush_events = pipeline.flush()
+                        for event in flush_events:
+                            segments_count += 1
+                            await websocket.send_json(event.to_dict())
+
+                        total_audio_s = total_audio_samples / SAMPLE_RATE
+                        await websocket.send_json({
+                            "type": "session.ended",
+                            "session_id": session_id,
+                            "segments_transcribed": segments_count,
+                            "total_audio_s": round(total_audio_s, 2),
+                            "session_duration_s": round(time.time() - session_start, 2),
+                        })
+                        break
+
+                    elif "audio" in data:
+                        # Legacy: base64-encoded audio (backward compatibility)
+                        import base64
+                        pcm_bytes = base64.b64decode(data["audio"])
+                        total_audio_samples += len(pcm_bytes) // 2
+                        events = pipeline.feed_audio(pcm_bytes)
+                        for event in events:
+                            segments_count += 1
+                            await websocket.send_json(event.to_dict())
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            try:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": str(e),
+                })
+            except Exception:
+                pass
+        finally:
+            active_sessions.pop(session_id, None)
+
+    # ── Legacy WebSocket (backward compat) ───────────────────────────────
+
+    @app.websocket("/ws/transcribe")
+    async def ws_transcribe_legacy(websocket: WebSocket):
+        """Legacy endpoint — redirects to new protocol internally."""
+        await websocket.accept()
+        session_id = uuid.uuid4().hex[:12]
+
+        config = SessionConfig()
+        pipeline = StreamingPipeline(asr_model, config, device)
+
+        try:
+            await websocket.send_json({"status": "ready", "sample_rate": SAMPLE_RATE})
+
+            while True:
+                msg = await websocket.receive()
+                text_data = msg.get("text")
+                bytes_data = msg.get("bytes")
+
+                if text_data:
+                    data = json.loads(text_data)
+                    if data.get("end"):
+                        for event in pipeline.flush():
+                            await websocket.send_json({
+                                "text": event.text, "is_final": True
+                            })
+                        break
+                    audio_b64 = data.get("audio")
+                    if audio_b64:
+                        import base64
+                        pcm_bytes = base64.b64decode(audio_b64)
+                        for event in pipeline.feed_audio(pcm_bytes):
+                            await websocket.send_json({
+                                "text": event.text, "is_final": False
+                            })
+
+                elif bytes_data:
+                    for event in pipeline.feed_audio(bytes_data):
+                        await websocket.send_json({
+                            "text": event.text, "is_final": False
+                        })
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            try:
+                await websocket.send_json({"error": str(e)})
+            except Exception:
+                pass
+
+    # ── HTTP: File upload with streaming response ─────────────────────
+
     async def _transcribe_file_handler(request):
-        """Raw Starlette handler - bypasses FastAPI dependency injection to avoid 422."""
+        """Raw Starlette handler for file upload — streams NDJSON."""
         form = await request.form()
         file = form.get("file")
         if not file or not hasattr(file, "read"):
-            from starlette.responses import JSONResponse
-            return JSONResponse({"detail": "No file provided. Use form-data key 'file'."}, status_code=400)
+            return JSONResponse(
+                {"detail": "No file provided. Use form-data key 'file'."},
+                status_code=400,
+            )
+
         suffix = ".wav"
         if file.filename and "." in file.filename:
             suffix = "." + file.filename.rsplit(".", 1)[-1]
+
         content = await file.read()
+
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             try:
                 tmp.write(content)
                 tmp.flush()
                 tmp_path = tmp.name
 
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-
                 def generate():
                     try:
                         audio = _load_audio_file(tmp_path)
-                        pipeline = StreamingSTTPipeline(asr_model, vad_model, vad_utils, device)
+                        config = SessionConfig()
+                        pipeline = StreamingPipeline(asr_model, config, device)
                         chunk_samples = int(1.0 * SAMPLE_RATE)
 
-                        # Buffer one transcript behind so we can mark the very
-                        # last one as is_final=True, even if it came from process()
-                        # rather than flush() (VAD often detects the last segment
-                        # end during the loop, leaving flush() with nothing to emit).
                         pending = None
-
                         for i in range(0, len(audio), chunk_samples):
-                            chunk = audio[i : i + chunk_samples]
-                            pipeline.add_audio_float(chunk)
-                            for t in pipeline.process():
+                            chunk = audio[i: i + chunk_samples]
+                            events = pipeline.feed_audio_float(chunk)
+                            for event in events:
                                 if pending is not None:
-                                    yield json.dumps({"text": pending, "is_final": False}) + "\n"
-                                pending = t
-                        for t in pipeline.flush():
+                                    pending_dict = pending.to_dict()
+                                    pending_dict["is_final"] = False
+                                    yield json.dumps(pending_dict) + "\n"
+                                pending = event
+
+                        for event in pipeline.flush():
                             if pending is not None:
-                                yield json.dumps({"text": pending, "is_final": False}) + "\n"
-                            pending = t
+                                pending_dict = pending.to_dict()
+                                pending_dict["is_final"] = False
+                                yield json.dumps(pending_dict) + "\n"
+                            pending = event
 
-                        # Emit the last (and truly final) transcript
+                        # Last transcript is final
                         if pending is not None:
-                            yield json.dumps({"text": pending, "is_final": True}) + "\n"
-
+                            pending_dict = pending.to_dict()
+                            pending_dict["is_final"] = True
+                            yield json.dumps(pending_dict) + "\n"
                     finally:
                         try:
                             os.remove(tmp_path)
@@ -269,58 +356,16 @@ def create_streaming_app(
                     os.remove(tmp.name)
                 except OSError:
                     pass
-                from starlette.responses import JSONResponse
                 return JSONResponse({"detail": str(e)}, status_code=400)
 
     from starlette.routing import Route
-    app.router.routes.append(Route("/transcribe/file", _transcribe_file_handler, methods=["POST"]))
-
-    @app.websocket("/ws/transcribe")
-    async def ws_transcribe(websocket: WebSocket):
-        await websocket.accept()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        try:
-            await websocket.send_json({"status": "ready", "sample_rate": SAMPLE_RATE})
-        except Exception:
-            return
-
-        pipeline = StreamingSTTPipeline(asr_model, vad_model, vad_utils, device)
-
-        try:
-            while True:
-                msg = await websocket.receive()
-                text_data = msg.get("text")
-                bytes_data = msg.get("bytes")
-
-                if text_data:
-                    data = json.loads(text_data)
-                    if data.get("end"):
-                        for t in pipeline.flush():
-                            await websocket.send_json({"text": t, "is_final": True})
-                        break
-                    audio_b64 = data.get("audio")
-                    if audio_b64:
-                        pcm = np.frombuffer(base64.b64decode(audio_b64), dtype=np.int16)
-                        pipeline.add_audio(pcm)
-                        for t in pipeline.process():
-                            await websocket.send_json({"text": t, "is_final": False})
-
-                elif bytes_data:
-                    pcm = np.frombuffer(bytes_data, dtype=np.int16)
-                    pipeline.add_audio(pcm)
-                    for t in pipeline.process():
-                        await websocket.send_json({"text": t, "is_final": False})
-
-        except WebSocketDisconnect:
-            pass
-        except Exception as e:
-            try:
-                await websocket.send_json({"error": str(e)})
-            except Exception:
-                pass
+    app.router.routes.append(
+        Route("/transcribe/file", _transcribe_file_handler, methods=["POST"])
+    )
 
     return app
 
+
+# ── Default app instance (for uvicorn stt_streaming_server:app) ──────────
 
 app = create_streaming_app()
