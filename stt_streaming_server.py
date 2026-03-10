@@ -78,6 +78,7 @@ class StreamingSTTPipeline:
         self.vad_iterator = create_vad_iterator(vad_model, vad_utils, SAMPLE_RATE)
         self.buffer = np.array([], dtype=np.float32)
         self._fed_samples = 0
+        self._segment_start = None  # tracks start of current speech segment
 
     def add_audio(self, pcm_int16: np.ndarray) -> None:
         """Append PCM int16 to buffer. Converts to float32 [-1, 1]."""
@@ -102,22 +103,31 @@ class StreamingSTTPipeline:
             speech_dict = self.vad_iterator(chunk_tensor, return_seconds=True)
 
             if speech_dict:
-                start_s = speech_dict["start"]
-                end_s = speech_dict["end"]
-                start_idx = int(start_s * SAMPLE_RATE)
-                end_idx = int(end_s * SAMPLE_RATE)
-                end_idx = min(end_idx, len(self.buffer), self._fed_samples)
-                start_idx = max(0, min(start_idx, end_idx - 1))
+                # Silero VAD fires TWO separate events:
+                #   {"start": X}  — speech begins
+                #   {"end": X}    — speech ends
+                # We cache the start and only transcribe on the end event.
+                if "start" in speech_dict:
+                    self._segment_start = speech_dict["start"]
 
-                if end_idx > start_idx:
-                    segment = self.buffer[start_idx:end_idx]
-                    text = self._transcribe_segment(segment)
-                    if text.strip():
-                        transcripts.append(text)
+                if "end" in speech_dict and self._segment_start is not None:
+                    start_s = self._segment_start
+                    end_s = speech_dict["end"]
+                    start_idx = int(start_s * SAMPLE_RATE)
+                    end_idx = int(end_s * SAMPLE_RATE)
+                    end_idx = min(end_idx, len(self.buffer), self._fed_samples)
+                    start_idx = max(0, min(start_idx, end_idx - 1))
 
-                self.vad_iterator.reset_states()
-                self._trim_buffer(end_idx)
-                self._fed_samples = 0
+                    if end_idx > start_idx:
+                        segment = self.buffer[start_idx:end_idx]
+                        text = self._transcribe_segment(segment)
+                        if text.strip():
+                            transcripts.append(text)
+
+                    self._segment_start = None
+                    self.vad_iterator.reset_states()
+                    self._trim_buffer(end_idx)
+                    self._fed_samples = 0
 
         return transcripts
 
@@ -131,6 +141,7 @@ class StreamingSTTPipeline:
                 transcripts.append(text)
         self.buffer = np.array([], dtype=np.float32)
         self._fed_samples = 0
+        self._segment_start = None
         self.vad_iterator.reset_states()
         return transcripts
 
