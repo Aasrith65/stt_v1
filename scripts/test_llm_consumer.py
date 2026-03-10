@@ -97,8 +97,14 @@ async def run(audio_path: str, ws_url: str = "ws://localhost:8000/ws/stt"):
     chunk_ms = 100
     chunk_size = max(512, (int(16000 * chunk_ms / 1000) // 512) * 512)
 
-    # ngrok free tier requires this header to bypass browser warning
-    extra_headers = {"ngrok-skip-browser-warning": "true"}
+    import urllib.parse
+    parsed_url = urllib.parse.urlparse(ws_url)
+    host = parsed_url.netloc
+
+    extra_headers = {
+        "ngrok-skip-browser-warning": "true",
+        "Origin": f"https://{host}"
+    }
 
     async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
         # Send config

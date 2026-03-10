@@ -47,7 +47,13 @@ def main():
     )
 
     app = create_streaming_app(server_config)
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        app, 
+        host=args.host, 
+        port=args.port, 
+        proxy_headers=True, 
+        forwarded_allow_ips="*"
+    )
 
 
 if __name__ == "__main__":

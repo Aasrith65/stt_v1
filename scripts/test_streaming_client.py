@@ -50,10 +50,16 @@ async def run(
 
     latencies = []
     segment_count = 0
-    stream_start = time.time()
+    import urllib.parse
+    parsed_url = urllib.parse.urlparse(ws_url)
+    host = parsed_url.netloc
 
-    # ngrok free tier requires this header to bypass browser warning
-    extra_headers = {"ngrok-skip-browser-warning": "true"}
+    # ngrok free tier requires this header to bypass browser warning.
+    # Uvicorn also requires Origin to match Host for WebSocket upgrades.
+    extra_headers = {
+        "ngrok-skip-browser-warning": "true",
+        "Origin": f"https://{host}"
+    }
 
     async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
         # Step 1: Send config
