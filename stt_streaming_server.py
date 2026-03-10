@@ -1,13 +1,10 @@
 """
-Streaming STT WebSocket Server
+Streaming STT Server
 
-- Accepts streaming audio via WebSocket (base64 JSON for Postman)
-- Server-side Silero VAD detects speech segments
-- Parakeet transcribes each segment
-- Streams transcripts back to client
+- WebSocket: streaming audio via ws://.../ws/transcribe (base64 JSON)
+- HTTP: POST /transcribe/file - upload audio file, receive streaming transcript chunks
 
 Run: python run_streaming_server.py
-Postman: ws://localhost:8000/ws/transcribe
 """
 
 from __future__ import annotations
@@ -87,6 +84,10 @@ class StreamingSTTPipeline:
         float32 = pcm_int16.astype(np.float32) / 32768.0
         self.buffer = np.concatenate([self.buffer, float32])
 
+    def add_audio_float(self, audio_float: np.ndarray) -> None:
+        """Append float32 [-1,1] audio to buffer."""
+        self.buffer = np.concatenate([self.buffer, audio_float.astype(np.float32)])
+
     def process(self) -> list[str]:
         """
         Feed buffer to VAD. Return list of transcripts for completed segments.
@@ -151,11 +152,19 @@ class StreamingSTTPipeline:
 
 # ── FastAPI + WebSocket ─────────────────────────────────────────────────────
 
+def _load_audio_file(file_path: str) -> np.ndarray:
+    """Load audio file as 16kHz mono float32. Uses librosa for format support."""
+    import librosa
+    audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
+    return audio.astype(np.float32)
+
+
 def create_streaming_app(
     model_name: str = "nvidia/parakeet-tdt-1.1b",
 ):
     try:
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+        from fastapi.responses import StreamingResponse
     except ImportError:
         raise ImportError("pip install fastapi uvicorn websockets")
 
@@ -183,8 +192,56 @@ def create_streaming_app(
         return {
             "status": "ok",
             "ws_url": "/ws/transcribe",
+            "file_url": "POST /transcribe/file",
             "protocol": "Send JSON: {\"audio\": \"base64...\"} or {\"end\": true}",
         }
+
+    @app.post("/transcribe/file")
+    async def transcribe_file(file: UploadFile = File(...)):
+        """
+        Upload an audio file. Returns streaming transcript chunks (NDJSON).
+        Each line: {"text": "...", "is_final": false/true}
+        """
+        suffix = ".wav"
+        if file.filename and "." in file.filename:
+            suffix = "." + file.filename.rsplit(".", 1)[-1]
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            try:
+                content = await file.read()
+                tmp.write(content)
+                tmp.flush()
+                tmp_path = tmp.name
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+
+                def generate():
+                    try:
+                        audio = _load_audio_file(tmp_path)
+                        pipeline = StreamingSTTPipeline(asr_model, vad_model, vad_utils, device)
+                        chunk_samples = int(1.0 * SAMPLE_RATE)
+                        for i in range(0, len(audio), chunk_samples):
+                            chunk = audio[i : i + chunk_samples]
+                            pipeline.add_audio_float(chunk)
+                            for t in pipeline.process():
+                                yield json.dumps({"text": t, "is_final": False}) + "\n"
+                        for t in pipeline.flush():
+                            yield json.dumps({"text": t, "is_final": True}) + "\n"
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+
+                return StreamingResponse(
+                    generate(),
+                    media_type="application/x-ndjson",
+                )
+            except Exception as e:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise HTTPException(status_code=400, detail=str(e))
 
     @app.websocket("/ws/transcribe")
     async def ws_transcribe(websocket: WebSocket):
