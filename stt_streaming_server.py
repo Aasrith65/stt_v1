@@ -165,7 +165,6 @@ def create_streaming_app(
     try:
         from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
         from fastapi.responses import StreamingResponse
-        from starlette.requests import Request
     except ImportError:
         raise ImportError("pip install fastapi uvicorn websockets")
 
@@ -197,17 +196,13 @@ def create_streaming_app(
             "protocol": "Send JSON: {\"audio\": \"base64...\"} or {\"end\": true}",
         }
 
-    @app.post("/transcribe/file")
-    async def transcribe_file(http_req: Request):
-        """
-        Upload an audio file. Returns streaming transcript chunks (NDJSON).
-        Each line: {"text": "...", "is_final": false/true}
-        Body: multipart/form-data with key "file"
-        """
-        form = await http_req.form()
+    async def _transcribe_file_handler(request):
+        """Raw Starlette handler - bypasses FastAPI dependency injection to avoid 422."""
+        form = await request.form()
         file = form.get("file")
         if not file or not hasattr(file, "read"):
-            raise HTTPException(status_code=400, detail="No file provided. Use form-data key 'file'.")
+            from starlette.responses import JSONResponse
+            return JSONResponse({"detail": "No file provided. Use form-data key 'file'."}, status_code=400)
         suffix = ".wav"
         if file.filename and "." in file.filename:
             suffix = "." + file.filename.rsplit(".", 1)[-1]
@@ -247,7 +242,11 @@ def create_streaming_app(
                     os.remove(tmp.name)
                 except OSError:
                     pass
-                raise HTTPException(status_code=400, detail=str(e))
+                from starlette.responses import JSONResponse
+                return JSONResponse({"detail": str(e)}, status_code=400)
+
+    from starlette.routing import Route
+    app.router.routes.append(Route("/transcribe/file", _transcribe_file_handler, methods=["POST"]))
 
     @app.websocket("/ws/transcribe")
     async def ws_transcribe(websocket: WebSocket):
