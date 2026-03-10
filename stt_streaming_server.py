@@ -154,7 +154,14 @@ def create_streaming_app(server_config: Optional[ServerConfig] = None):
 
     @app.websocket("/ws/stt")
     async def ws_stt(websocket: WebSocket):
-        await websocket.accept()
+        print("\n--- [DEBUG] ENTERED ws_stt ENDPOINT ---")
+        try:
+            await websocket.accept()
+            print("--- [DEBUG] WEBSOCKET ACCEPTED SUCCESSFULLY ---")
+        except Exception as e:
+            print(f"--- [DEBUG] WEBSOCKET ACCEPT FAILED: {type(e)} {e} ---")
+            raise
+            
         session_id = uuid.uuid4().hex[:12]
 
         # Check session limit
