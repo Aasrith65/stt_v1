@@ -83,7 +83,12 @@ class MockLLMProcessor:
         }
 
 
-async def run(audio_path: str, ws_url: str = "ws://localhost:8000/ws/stt"):
+async def run(
+    audio_path: str,
+    ws_url: str = "ws://localhost:8000/ws/stt",
+    origin: str | None = None,
+    use_ngrok_header: bool = False,
+):
     print("=" * 60)
     print("  MOCK LLM CONSUMER — STT Integration Demo")
     print("=" * 60)
@@ -97,16 +102,15 @@ async def run(audio_path: str, ws_url: str = "ws://localhost:8000/ws/stt"):
     chunk_ms = 100
     chunk_size = max(512, (int(16000 * chunk_ms / 1000) // 512) * 512)
 
-    import urllib.parse
-    parsed_url = urllib.parse.urlparse(ws_url)
-    host = parsed_url.netloc
+    connect_kwargs = {}
+    if origin:
+        connect_kwargs["origin"] = origin
+    if use_ngrok_header:
+        connect_kwargs["additional_headers"] = {
+            "ngrok-skip-browser-warning": "true",
+        }
 
-    extra_headers = {
-        "ngrok-skip-browser-warning": "true",
-        "Origin": f"https://{host}"
-    }
-
-    async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
+    async with websockets.connect(ws_url, **connect_kwargs) as ws:
         # Send config
         await ws.send(json.dumps({
             "type": "config",
@@ -178,5 +182,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mock LLM consumer for STT")
     parser.add_argument("audio", help="Path to WAV file")
     parser.add_argument("--url", default="ws://localhost:8000/ws/stt")
+    parser.add_argument("--origin", help="Optional Origin header for strict proxy deployments")
+    parser.add_argument("--ngrok", action="store_true", help="Send ngrok browser-warning bypass header")
     args = parser.parse_args()
-    asyncio.run(run(args.audio, args.url))
+    asyncio.run(run(args.audio, args.url, args.origin, args.ngrok))

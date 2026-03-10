@@ -33,6 +33,8 @@ async def run(
     chunk_ms: int = 100,
     vad_engine: str = "silero",
     silence_duration_ms: int = 800,
+    origin: str | None = None,
+    use_ngrok_header: bool = False,
 ):
     """Stream audio file to STT server and display results."""
     print(f"Loading: {audio_path}")
@@ -50,18 +52,17 @@ async def run(
 
     latencies = []
     segment_count = 0
-    import urllib.parse
-    parsed_url = urllib.parse.urlparse(ws_url)
-    host = parsed_url.netloc
+    connect_kwargs = {}
+    if origin:
+        connect_kwargs["origin"] = origin
+    if use_ngrok_header:
+        # Only needed when connecting through an ngrok free-tier URL.
+        connect_kwargs["additional_headers"] = {
+            "ngrok-skip-browser-warning": "true",
+        }
 
-    # ngrok free tier requires this header to bypass browser warning.
-    # Uvicorn also requires Origin to match Host for WebSocket upgrades.
-    extra_headers = {
-        "ngrok-skip-browser-warning": "true",
-        "Origin": f"https://{host}"
-    }
-
-    async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
+    stream_start = time.time()
+    async with websockets.connect(ws_url, **connect_kwargs) as ws:
         # Step 1: Send config
         config_msg = {
             "type": "config",
@@ -174,9 +175,12 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-ms", type=int, default=100, help="Chunk size in ms")
     parser.add_argument("--vad-engine", choices=["silero", "energy", "none"], default="silero")
     parser.add_argument("--silence-ms", type=int, default=800, help="Silence duration for VAD")
+    parser.add_argument("--origin", help="Optional Origin header for strict proxy deployments")
+    parser.add_argument("--ngrok", action="store_true", help="Send ngrok browser-warning bypass header")
     args = parser.parse_args()
 
     asyncio.run(run(
         args.audio, args.url, args.chunk_ms,
         args.vad_engine, args.silence_ms,
+        args.origin, args.ngrok,
     ))
