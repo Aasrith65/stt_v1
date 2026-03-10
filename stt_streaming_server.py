@@ -10,6 +10,7 @@ Run: python run_streaming_server.py
 from __future__ import annotations
 
 import base64
+from typing import Annotated
 import json
 import os
 import tempfile
@@ -163,7 +164,7 @@ def create_streaming_app(
     model_name: str = "nvidia/parakeet-tdt-1.1b",
 ):
     try:
-        from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
         from fastapi.responses import StreamingResponse
     except ImportError:
         raise ImportError("pip install fastapi uvicorn websockets")
@@ -197,18 +198,14 @@ def create_streaming_app(
         }
 
     @app.post("/transcribe/file")
-    async def transcribe_file(request: Request):
+    async def transcribe_file(file: Annotated[UploadFile, File(description="Audio file (WAV, MP3, etc.)")]):
         """
         Upload an audio file. Returns streaming transcript chunks (NDJSON).
         Each line: {"text": "...", "is_final": false/true}
         Body: multipart/form-data with key "file"
         """
-        form = await request.form()
-        file = form.get("file")
-        if not file or not hasattr(file, "read"):
-            raise HTTPException(status_code=400, detail="No file provided. Use form-data key 'file'.")
         suffix = ".wav"
-        if getattr(file, "filename", None) and "." in file.filename:
+        if file.filename and "." in file.filename:
             suffix = "." + file.filename.rsplit(".", 1)[-1]
         content = await file.read()
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
